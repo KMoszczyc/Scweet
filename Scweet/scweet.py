@@ -6,8 +6,7 @@ from time import sleep
 import random
 import pandas as pd
 
-from .utils import init_driver, get_last_date_from_csv, log_search_page, keep_scroling, dowload_images
-
+from .utils import init_driver, get_last_date_from_csv, log_search_page, keep_scroling, dowload_images, log_in, get_retry_button, handle_retry_timout_screen
 
 
 def scrape(since, until=None, words=None, to_account=None, from_account=None, mention_account=None, interval=5, lang=None,
@@ -74,6 +73,8 @@ def scrape(since, until=None, words=None, to_account=None, from_account=None, me
         since = str(get_last_date_from_csv(path))[:10]
         write_mode = 'a'
 
+    log_in(driver, '.env', wait=5)
+
     #------------------------- start scraping : keep searching until until
     # open the file
     with open(path, write_mode, newline='', encoding='utf-8') as f:
@@ -82,6 +83,7 @@ def scrape(since, until=None, words=None, to_account=None, from_account=None, me
             # write the csv header
             writer.writerow(header)
         # log search page for a specific <interval> of time and keep scrolling unltil scrolling stops or reach the <until>
+        interval_sum = 0
         while until_local <= datetime.datetime.strptime(until, '%Y-%m-%d'):
             # number of scrolls
             scroll = 0
@@ -96,6 +98,10 @@ def scrape(since, until=None, words=None, to_account=None, from_account=None, me
                             from_account=from_account, mention_account=mention_account, hashtag=hashtag, lang=lang, 
                             display_type=display_type, filter_replies=filter_replies, proximity=proximity,
                             geocode=geocode, minreplies=minreplies, minlikes=minlikes, minretweets=minretweets)
+
+            # After too many requests twitter may timout us temprarily by a retry button - click it every now and then, this may take a few minutes
+            handle_retry_timout_screen(driver)
+
             # number of logged pages (refresh each <interval>)
             refresh += 1
             # number of days crossed
@@ -125,7 +131,19 @@ def scrape(since, until=None, words=None, to_account=None, from_account=None, me
             else:
                 until_local = until_local + datetime.timedelta(days=interval)
 
-    data = pd.DataFrame(data, columns = ['UserScreenName', 'UserName', 'Timestamp', 'Text', 'Embedded_text', 'Emojis', 
+            df = pd.DataFrame(data, columns=['UserScreenName', 'UserName', 'Timestamp', 'Text', 'Embedded_text', 'Emojis',
+                                             'Comments', 'Likes', 'Retweets', 'Image link', 'Tweet URL'])
+
+            print(f'================ Got {len(df)} tweets already at {until_local.strftime('%Y-%m-%d')} ================')
+            path = f'outputs/{from_account}_{until_local.strftime('%Y-%m-%d')}.parquet'
+            df.to_parquet(path)
+
+            interval_sum += interval
+            if interval_sum % 10 == 0:
+                print('======================== Doin some sleeping for 1 min so twitter likes us ===========================')
+                sleep(random.uniform(55, 65))
+
+    df = pd.DataFrame(data, columns = ['UserScreenName', 'UserName', 'Timestamp', 'Text', 'Embedded_text', 'Emojis',
                               'Comments', 'Likes', 'Retweets','Image link', 'Tweet URL'])
 
     # save images
@@ -135,12 +153,12 @@ def scrape(since, until=None, words=None, to_account=None, from_account=None, me
         if not os.path.exists(save_images_dir):
             os.makedirs(save_images_dir)
 
-        dowload_images(data["Image link"], save_images_dir)
+        dowload_images(df["Image link"], save_images_dir)
 
     # close the web driver
     driver.close()
 
-    return data
+    return df
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Scrape tweets.')
