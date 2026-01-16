@@ -1,81 +1,474 @@
-"""
-Scweet - Twitter Scraping Tool
-Author: Yassine Ait Jeddi (@altimis)
-License: MIT
-Repository: https://github.com/Altimis/scweet
-"""
-
+from io import StringIO, BytesIO
+import os
 import re
+from time import sleep
 import random
-import string
-from .mailtm import *
+import chromedriver_autoinstaller
+from selenium.common.exceptions import NoSuchElementException
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import datetime
+import pandas as pd
+import platform
+from selenium.webdriver.common.keys import Keys
+# import pathlib
+from pathlib import Path
+
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from . import const
 import urllib
 
-
-async def check_element_if_exists_by_text(tab, text, timeout=10):
-    try:
-        await tab.find(text, timeout=timeout)
-        return True
-    except:
-        return False
+from .const import get_username, get_password, get_email
 
 
-async def check_element_if_exists_by_css(tab, css, timeout=20):
-    try:
-        await tab.select(css, timeout=timeout)
-        return True
-    except:
-        return False
+def load_netscape_cookies(cookies_dir) -> dict:
+    cookies_path = Path(cookies_dir)
+    multiple_account_cookies = {}
+    counter = 0
 
+    for filename in os.listdir(cookies_path):
+        filepath = os.path.join(cookies_path, filename)
+        multiple_account_cookies[counter] = load_netscape_cookies_single(filepath)
+        counter+=1
+    return multiple_account_cookies
 
-async def get_code_from_email(email_address, email_password):
-    try:
-        retries = 0
-        while retries < 5:
-            mailclient = MailTMClient()
-            resp_code, token = mailclient.login(email_address, email_password)
-            if 'Invalid' in token:
-                print("couldn't login to email")
-                return "code_not_found"
-            r = requests.get(
-                "https://api.mail.tm/messages",
-                headers={
-                    "Authorization": "Bearer " + token,
-                    "Content-Type": "application/json",
-                },
-            )
-            inbox = []
-            for emailJson in r.json()["hydra:member"]:
-                inbox.append(Mail(emailJson, token))
-            ig_messages = [mss.read() for mss in inbox] # if mss.read()['from']['name'] == "Instagram"]
-            message = ig_messages[0]
-            text = message['subject']
-            print(text)
-            match = re.search(r'Your X confirmation code is (.+)\b', text)
-            if match:
-                verif_code = match.group(1)  # Access the first capturing group
-                log = f"Verification code found: {verif_code}"
-                print(log)
-                return verif_code
-            else:
-                retries += 1
+def load_netscape_cookies_single(path):
+    cookies = []
+    with open(path, "r", encoding="utf8") as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
                 continue
 
-        return "code_not_found"
-    except Exception as e:
-        log = f"An error occurred while fetching email: {e}"
-        print(log)
-        return "code_not_found"
+            parts = line.strip().split("\t")
+            if len(parts) != 7:
+                continue
+
+            domain, flag, cookie_path, secure, expiry, name, value = parts
+
+            cookies.append({
+                "domain": domain,
+                "path": cookie_path,
+                "secure": secure.lower() == "true",
+                "expiry": int(expiry),
+                "name": name,
+                "value": value,
+                "httpOnly": False,     # Netscape file doesn’t store this
+                "sameSite": "Lax"      # safe default
+            })
+    return cookies
+
+def get_data(card, save_images=False, save_dir=None):
+    """Extract data from tweet card"""
+    image_links = []
+
+    try:
+        username = card.find_element('xpath','.//span').text
+    except:
+        return
+
+    try:
+        handle = card.find_element('xpath','.//span[contains(text(), "@")]').text
+    except:
+        return
+
+    try:
+        postdate = card.find_element('xpath','.//time').get_attribute('datetime')
+    except:
+        return
+
+    try:
+        text = card.find_element('xpath','.//div[2]/div[2]/div[1]').text
+    except:
+        text = ""
+
+    try:
+        embedded = card.find_element('xpath','.//div[2]/div[2]/div[2]').text
+    except:
+        embedded = ""
+
+    # text = comment + embedded
+
+    try:
+        reply_cnt = card.find_element('xpath','.//div[@data-testid="reply"]').text
+    except:
+        reply_cnt = 0
+
+    try:
+        retweet_cnt = card.find_element('xpath','.//div[@data-testid="retweet"]').text
+    except:
+        retweet_cnt = 0
+
+    try:
+        like_cnt = card.find_element('xpath','.//div[@data-testid="like"]').text
+    except:
+        like_cnt = 0
+
+    try:
+        elements = card.find_elements('xpath','.//div[2]/div[2]//img[contains(@src, "https://pbs.twimg.com/")]')
+        for element in elements:
+            image_links.append(element.get_attribute('src'))
+    except:
+        image_links = []
+
+    # if save_images == True:
+    #	for image_url in image_links:
+    #		save_image(image_url, image_url, save_dir)
+    # handle promoted tweets
+
+    try:
+        promoted = card.find_element('xpath','.//div[2]/div[2]/[last()]//span').text == "Promoted"
+    except:
+        promoted = False
+    if promoted:
+        return
+
+    # get a string of all emojis contained in the tweet
+    try:
+        emoji_tags = card.find_elements('xpath','.//img[contains(@src, "emoji")]')
+    except:
+        return
+    emoji_list = []
+    for tag in emoji_tags:
+        try:
+            filename = tag.get_attribute('src')
+            emoji = chr(int(re.search(r'svg\/([a-z0-9]+)\.svg', filename).group(1), base=16))
+        except AttributeError:
+            continue
+        if emoji:
+            emoji_list.append(emoji)
+    emojis = ' '.join(emoji_list)
+
+    # tweet url
+    try:
+        element = card.find_element('xpath','.//a[contains(@href, "/status/")]')
+        tweet_url = element.get_attribute('href')
+    except:
+        return
+
+    tweet = (
+        username, handle, postdate, text, embedded, emojis, reply_cnt, retweet_cnt, like_cnt, image_links, tweet_url)
+    return tweet
 
 
-def extract_count_from_aria_label(element):
-    if not element:
-        return "0"
-    aria_label = element.get('aria-label', '')
-    match = re.search(r'(\d+)', aria_label)
-    if match:
-        return match.group(1)
-    return "0"
+def init_driver(headless=True, proxy=None, show_images=False, option=None):
+    """ initiate a chromedriver instance 
+        --option : other option to add (str)
+    """
+
+    # create instance of web driver
+    chromedriver_path = chromedriver_autoinstaller.install()
+    # options
+    options = Options()
+    if headless is True:
+        print("Scraping on headless mode.")
+        options.add_argument('--disable-gpu')
+        options.headless = True
+    else:
+        options.headless = False
+    options.add_argument('log-level=3')
+    if proxy is not None:
+        options.add_argument('--proxy-server=%s' % proxy)
+        print("using proxy : ", proxy)
+    if show_images == False:
+        prefs = {"profile.managed_default_content_settings.images": 2}
+        options.add_experimental_option("prefs", prefs)
+    if option is not None:
+        options.add_argument(option)
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(100)
+    return driver
+
+
+def log_search_page(driver, since, until_local, lang, display_type, words, to_account, from_account, mention_account,
+                    hashtag, filter_replies, proximity,
+                    geocode, minreplies, minlikes, minretweets):
+    """ Search for this query between since and until_local"""
+    # format the <from_account>, <to_account> and <hash_tags>
+    from_account = "(from%3A" + from_account + ")%20" if from_account is not None else ""
+    to_account = "(to%3A" + to_account + ")%20" if to_account is not None else ""
+    mention_account = "(%40" + mention_account + ")%20" if mention_account is not None else ""
+    hash_tags = "(%23" + hashtag + ")%20" if hashtag is not None else ""
+
+    if words is not None:
+        if len(words) == 1:
+            words = "(" + str(''.join(words)) + ")%20"
+        else:
+            words = "(" + str('%20OR%20'.join(words)) + ")%20"
+    else:
+        words = ""
+
+    if lang is not None:
+        lang = 'lang%3A' + lang
+    else:
+        lang = ""
+
+    until_local = "until%3A" + until_local + "%20"
+    since = "since%3A" + since + "%20"
+
+    if display_type == "Latest" or display_type == "latest":
+        display_type = "&f=live"
+    elif display_type == "Image" or display_type == "image":
+        display_type = "&f=image"
+    else:
+        display_type = ""
+
+    # filter replies 
+    if filter_replies == True:
+        filter_replies = "%20-filter%3Areplies"
+    else:
+        filter_replies = ""
+    # geo
+    if geocode is not None:
+        geocode = "%20geocode%3A" + geocode
+    else:
+        geocode = ""
+    # min number of replies
+    if minreplies is not None:
+        minreplies = "%20min_replies%3A" + str(minreplies)
+    else:
+        minreplies = ""
+    # min number of likes
+    if minlikes is not None:
+        minlikes = "%20min_faves%3A" + str(minlikes)
+    else:
+        minlikes = ""
+    # min number of retweets
+    if minretweets is not None:
+        minretweets = "%20min_retweets%3A" + str(minretweets)
+    else:
+        minretweets = ""
+
+    # proximity
+    if proximity == True:
+        # proximity = "&lf=on"  # at the end
+        proximity = "&f=top"  # at the end
+    else:
+        proximity = ""
+
+    path = 'https://twitter.com/search?q=' + words + from_account + to_account + mention_account + hash_tags + until_local + since + lang + filter_replies + geocode + minreplies + minlikes + minretweets + '&src=typed_query' + display_type + proximity
+    driver.get(path)
+    return path
+
+
+def get_last_date_from_csv(path):
+    df = pd.read_csv(path)
+    return datetime.datetime.strftime(max(pd.to_datetime(df["Timestamp"])), '%Y-%m-%dT%H:%M:%S.000Z')
+
+
+def log_in(driver, env, current_cookies, timeout=20, wait=4):
+    print('Trying to login')
+    email = get_email(env)  # const.EMAIL
+    password = get_password(env)  # const.PASSWORD
+    username = get_username(env)  # const.USERNAME
+
+    # driver.get('https://x.com/i/flow/login')
+    driver.get('https://x.com')
+    print("Current coookies!! ===============================================")
+    print(current_cookies)
+    for cookie in current_cookies:
+        print(cookie)
+        driver.add_cookie(cookie)
+
+    # Refresh the page to apply the cookies
+    driver.refresh()
+    driver.get('https://x.com')
+    sleep(random.uniform(2.5, 3.5))
+
+    try:
+        elem = driver.find_element(By.XPATH, "//*[@data-testid='tweetTextarea_0']")
+        print('xpath_check, ', el)
+        return True
+    except:
+        print('xpath_check not found, cookies expired')
+        return False
+
+    # driver.get('https://x.com/i/flow/login')
+    # driver.get('https://x.com')
+
+    # email_xpath = '//input[@autocomplete="username"]'
+    # password_xpath = '//input[@autocomplete="current-password"]'
+    # username_xpath = '//input[@data-testid="ocfEnterTextTextInput"]'
+    #
+    # sleep(random.uniform(wait, wait + 1))
+    #
+    # # enter email
+    # email_el = driver.find_element('xpath', email_xpath)
+    # print(email_el)
+    #
+    # sleep(random.uniform(wait, wait + 1))
+    # email_el.send_keys(email)
+    # sleep(random.uniform(wait, wait + 1))
+    # email_el.send_keys(Keys.RETURN)
+    # sleep(random.uniform(wait, wait + 1))
+    # # in case twitter spotted unusual login activity : enter your username
+    # if check_exists_by_xpath(username_xpath, driver):
+    #     username_el = driver.find_element('xpath', username_xpath)
+    #     sleep(random.uniform(wait, wait + 1))
+    #     username_el.send_keys(username)
+    #     sleep(random.uniform(wait, wait + 1))
+    #     username_el.send_keys(Keys.RETURN)
+    #     sleep(random.uniform(wait, wait + 1))
+    # # enter password
+    # password_el = driver.find_element('xpath', password_xpath)
+    # password_el.send_keys(password)
+    # sleep(random.uniform(wait, wait + 1))
+    # password_el.send_keys(Keys.RETURN)
+    sleep(random.uniform(wait, wait + 1))
+
+
+def keep_scroling(driver, data, writer, tweet_ids, scrolling, tweet_parsed, limit, scroll, last_position,
+                  save_images=False):
+    """ scrolling function for tweets crawling"""
+
+    save_images_dir = "/images"
+
+    if save_images == True:
+        if not os.path.exists(save_images_dir):
+            os.mkdir(save_images_dir)
+
+    while scrolling and tweet_parsed < limit:
+        sleep(random.uniform(0.5, 1.5))
+        # get the card of tweets
+        # page_cards = driver.find_elements_by_xpath('//article[@data-testid="tweet"]')  # changed div by article
+        page_cards = driver.find_elements("xpath", '//article[@data-testid="tweet"]')
+        for card in page_cards:
+            tweet = get_data(card, save_images, save_images_dir)
+            if tweet:
+                # check if the tweet is unique
+                # tweet_id = ''.join(tweet[:-2])
+                tweet_id = tweet[-1].split('/')[-1]
+                if tweet_id not in tweet_ids:
+                    tweet_ids.add(tweet_id)
+                    data.append(tweet)
+                    last_date = str(tweet[2])
+                    print("Tweet made at: " + str(last_date) + " is found.")
+                    writer.writerow(tweet)
+                    tweet_parsed += 1
+                    if tweet_parsed >= limit:
+                        break
+        scroll_attempt = 0
+        while tweet_parsed < limit:
+            # check scroll position
+            scroll += 1
+            print("scroll ", scroll)
+            sleep(random.uniform(0.5, 1.5))
+            driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+            curr_position = driver.execute_script("return window.pageYOffset;")
+            if last_position == curr_position:
+                scroll_attempt += 1
+                # end of scroll region
+                if scroll_attempt >= 2:
+                    scrolling = False
+                    break
+                else:
+                    sleep(random.uniform(0.5, 1.5))  # attempt another scroll
+            else:
+                last_position = curr_position
+                break
+    return driver, data, writer, tweet_ids, scrolling, tweet_parsed, scroll, last_position
+
+
+def get_users_follow(users, headless, env, follow=None, verbose=1, wait=2, limit=float('inf')):
+    """ get the following or followers of a list of users """
+
+    # initiate the driver
+    driver = init_driver(headless=headless)
+    sleep(wait)
+    # log in (the .env file should contain the username and password)
+    # driver.get('https://www.twitter.com/login')
+    log_in(driver, env, wait=wait)
+    sleep(wait)
+    # followers and following dict of each user
+    follows_users = {}
+
+    for user in users:
+        # if the login fails, find the new log in button and log in again.
+        if check_exists_by_link_text("Log in", driver):
+            print("Login failed. Retry...")
+            login = driver.find_element_by_link_text("Log in")
+            sleep(random.uniform(wait - 0.5, wait + 0.5))
+            driver.execute_script("arguments[0].click();", login)
+            sleep(random.uniform(wait - 0.5, wait + 0.5))
+            sleep(wait)
+            log_in(driver, env)
+            sleep(wait)
+        # case 2
+        if check_exists_by_xpath('//input[@name="session[username_or_email]"]', driver):
+            print("Login failed. Retry...")
+            sleep(wait)
+            log_in(driver, env)
+            sleep(wait)
+        print("Crawling " + user + " " + follow)
+        driver.get('https://twitter.com/' + user + '/' + follow)
+        sleep(random.uniform(wait - 0.5, wait + 0.5))
+        # check if we must keep scrolling
+        scrolling = True
+        last_position = driver.execute_script("return window.pageYOffset;")
+        follows_elem = []
+        follow_ids = set()
+        is_limit = False
+        while scrolling and not is_limit:
+            # get the card of following or followers
+            # this is the primaryColumn attribute that contains both followings and followers
+            primaryColumn = driver.find_element_by_xpath('//div[contains(@data-testid,"primaryColumn")]')
+            # extract only the Usercell
+            page_cards = primaryColumn.find_elements_by_xpath('//div[contains(@data-testid,"UserCell")]')
+            for card in page_cards:
+                # get the following or followers element
+                element = card.find_element_by_xpath('.//div[1]/div[1]/div[1]//a[1]')
+                follow_elem = element.get_attribute('href')
+                # append to the list
+                follow_id = str(follow_elem)
+                follow_elem = '@' + str(follow_elem).split('/')[-1]
+                if follow_id not in follow_ids:
+                    follow_ids.add(follow_id)
+                    follows_elem.append(follow_elem)
+                if len(follows_elem) >= limit:
+                    is_limit = True
+                    break
+                if verbose:
+                    print(follow_elem)
+            print("Found " + str(len(follows_elem)) + " " + follow)
+            scroll_attempt = 0
+            while not is_limit:
+                sleep(random.uniform(wait - 0.5, wait + 0.5))
+                driver.execute_script('window.scrollTo(0, document.body.scrollHeight);')
+                sleep(random.uniform(wait - 0.5, wait + 0.5))
+                curr_position = driver.execute_script("return window.pageYOffset;")
+                if last_position == curr_position:
+                    scroll_attempt += 1
+                    # end of scroll region
+                    if scroll_attempt >= 2:
+                        scrolling = False
+                        break
+                    else:
+                        sleep(random.uniform(wait - 0.5, wait + 0.5))  # attempt another scroll
+                else:
+                    last_position = curr_position
+                    break
+
+        follows_users[user] = follows_elem
+
+    return follows_users
+
+
+def check_exists_by_link_text(text, driver):
+    try:
+        driver.find_element_by_link_text(text)
+    except NoSuchElementException:
+        return False
+    return True
+
+
+def check_exists_by_xpath(xpath, driver):
+    timeout = 3
+    try:
+        driver.find_element('xpath', xpath)
+    except NoSuchElementException:
+        return False
+    return True
 
 
 def dowload_images(urls, save_dir):
@@ -84,99 +477,104 @@ def dowload_images(urls, save_dir):
             urllib.request.urlretrieve(url, save_dir + '/' + str(i + 1) + '_' + str(j + 1) + ".jpg")
 
 
-def generate_mail_prefix():
-    """
-    Generate a random, human-readable email prefix.
+def get_retry_button(driver):
+    """Find the retry button"""
+    # xpath = "//button[.//span[text()='Retry']]"
+    xpath = "//button[.//span/span[contains(text(), 'Retry')]]"
+    try:
+        retry_button = driver.find_element("xpath", xpath)
+    except NoSuchElementException:
+        return None
 
-    Returns:
-        str: A randomly generated email prefix.
-    """
-    # Define components for the email prefix
-    words = [
-        "jola", "needs", "abass", "smart", "xaax", "looool",
-        "brav", "smih", "kond", "jit", "blaso", "sota", "kaw", "jlov"
-    ]
-    separators = ['.', '_', '-', '']
-    random_word = random.choice(words)
-    random_number = ''.join(random.choices(string.digits, k=4))  # 4-digit number
-    random_letters = ''.join(random.choices(string.ascii_lowercase, k=3))  # 3 random letters
-    separator = random.choice(separators)
+    return retry_button
 
-    # Combine the components
-    prefix = f"{random_word}{separator}{random_letters}{separator}{random_number}"
+def get_login_field(driver):
+    """Find the login field"""
+    xpath = '//input[@autocomplete="username"]'
+    try:
+        login_elem = driver.find_element("xpath", xpath).clear()
+    except NoSuchElementException:
+        return None
 
-    return prefix
+    return login_elem
 
-def generate_password(length=12):
-    """
-    Generate a strong password with the specified length.
+def is_cookie_expired(driver):
+    """Check if the cookie is expired by looking for the login field. If its there then u need to manually replace the cookie in the /cookies dir"""
+    sleep(random.uniform(2, 3))
+    login_field = get_login_field(driver)
+    print('login_field', login_field)
+    if login_field is None:
+        return False
+    return True
 
-    Parameters:
-        length (int): Length of the password to be generated. Default is 12.
+def loading_screen_check(driver):
+    xpath = '//*[contains(@aria-label, "Loading")]'
+    try:
+        loading_el = driver.find_element("xpath", xpath)
+    except NoSuchElementException:
+        return None
 
-    Returns:
-        str: A randomly generated password.
-    """
-    if length < 8:
-        raise ValueError("Password length should be at least 8 characters.")
+    return loading_el
 
-    # Define the character pools
-    lower = string.ascii_lowercase
-    upper = string.ascii_uppercase
-    digits = string.digits
-    special = string.punctuation
+def handle_retry_timout_screen(driver, current_web_path, cookies, cookies_timeout_state, current_cookie_id):
+    """If retry button appears it means we did too much searching and we got to chill out."""
+    sleep(random.uniform(2, 3))
+    retry_button = get_retry_button(driver)
+    loading_el = loading_screen_check(driver)
 
-    # Ensure the password includes at least one of each type of character
-    all_characters = lower + upper + digits + special
-    password = [
-        random.choice(lower),
-        random.choice(upper),
-        random.choice(digits),
-        random.choice(special),
-    ]
 
-    # Fill the rest of the password length with random characters from all pools
-    password += random.choices(all_characters, k=length - 4)
+    if retry_button is not None or loading_el is not None:
+        cookies_timeout_state[current_cookie_id] = True
+        result = update_current_cookie(driver, cookies, cookies_timeout_state, current_cookie_id)
 
-    # Shuffle the password to ensure randomness
-    random.shuffle(password)
+        if result == -1:
+            current_cookie_id = 0
+            while retry_button is not None or loading_el is not None:
+                print("""============= All cookies got timeout by twitter, so we chilling (45-75s) ==============""")
+                sleep(random.uniform(45, 75))
+                driver.get(current_web_path)
+                sleep(random.uniform(3, 5))
+                retry_button.click()
+                sleep(random.uniform(2, 3))
+                retry_button = get_retry_button(driver)
+                loading_el = loading_screen_check(driver)
 
-    return ''.join(password)
+            cookies_timeout_state[current_cookie_id] = False
 
-def create_mailtm_email(max_retries=10):
-    """
-    Synchronous method to create an email account via MailTMClient.
-    Keeps trying until the email is successfully created or max_retries is reached.
+        return cookies_timeout_state, current_cookie_id, True
 
-    Returns a tuple (email, password) if successful; otherwise, returns (None, None).
-    """
-    retries = 0
-    mailtm = MailTMClient()
+    return cookies_timeout_state, current_cookie_id, False
 
-    while retries < max_retries:
-        try:
-            print("Creating email ...")
-            available_domains = mailtm.getAvailableDomains()
-            if available_domains and len(available_domains) > 0:
-                available_domain = available_domains[0].domain
-            else:
-                retries += 1
-                continue
 
-            # Assuming generate_mail_prefix and generate_password are now synchronous methods.
-            email_prefix = generate_mail_prefix()
-            password = generate_password()
-            email = f"{email_prefix}@{available_domain}"
-            resp, key = mailtm.register(email, password)
-            if resp == 0:
-                print(f"Email {email} created ")
-                return email, password
-            else:
-                print("Registration failed; retrying...")
-        except Exception as ex:
-            print(f"Exception in create_email: {ex}")
-        retries += 1
 
-    print("Max retries reached; no email created.")
-    return None, None
+def update_current_cookie(driver, cookies, cookies_timeout_state, current_cookie_id):
+    new_cookie_id = -1
+    new_cookie = None
+    for key, cookie in cookies.items():
+        if cookies_timeout_state[key] is False:
+            new_cookie_id = key
+            new_cookie = cookie
+            break
 
+    if new_cookie_id == -1: # all cookies timed out, we need to chill out
+        print("All cookies got timeout by twitter")
+        return -1
+
+    print(f"============== Switching from cookie [{current_cookie_id}] to cookie [{new_cookie_id}] due to cookie timeout,  lets go! ==============")
+    print(new_cookie)
+    driver.delete_all_cookies()
+    sleep(random.uniform(1, 2))
+    add_cookies(driver, new_cookie)
+    sleep(random.uniform(1, 2))
+    driver.get('https://x.com')
+
+    return new_cookie_id
+
+def add_cookies(driver, cookies):
+    driver.refresh()
+    driver.get('https://x.com')
+    sleep(random.uniform(1, 2))
+
+    for cookie in cookies:
+        driver.add_cookie(cookie)
+    driver.refresh()
